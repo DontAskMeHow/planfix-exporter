@@ -1,0 +1,262 @@
+stages:
+  - build
+  - test
+  - publish
+  - auto_release
+
+variables:
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_TLS_CERTDIR: ""
+
+  CONTAINER_IMAGE_NAME: "planfix-monitoring"
+  CONTAINER_TAG: "latest"
+  CONTAINER_VERSION: "1.0.1"
+
+  IMAGE_REPO: "$CONTAINER_IMAGE_NAME"
+  IMAGE_FULL: "$IMAGE_REPO:$CONTAINER_TAG-$CONTAINER_VERSION"
+  
+  BUILD_CONTAINER_NAME: "planfix-monitoring-build"
+  TEST_CONTAINER_NAME: "planfix-monitoring-test"
+
+build:
+  stage: build
+  when: manual
+  tags: [ci]
+  image: docker:24.0.7
+  services:
+    - name: docker:24.0.7-dind
+      command: ["--tls=false"]
+  script:
+    - echo "Build image $IMAGE_FULL from Dockerfile in repository"
+    - docker build -t "$IMAGE_FULL" .
+
+    - echo "Run container in dind"
+    - docker run -d --name "$BUILD_CONTAINER_NAME" "$IMAGE_FULL" sleep 30
+
+    - echo "Check app files inside container"
+    - docker exec "$BUILD_CONTAINER_NAME" sh -c "test -f /app/config.json"
+    - docker exec "$BUILD_CONTAINER_NAME" sh -c "test -f /app/requirements.txt"
+    - docker exec "$BUILD_CONTAINER_NAME" sh -c "test -f /app/app/main.py"
+    - docker exec "$BUILD_CONTAINER_NAME" sh -c "test -f /app/app/settings.py"
+    - docker exec "$BUILD_CONTAINER_NAME" sh -c "test -f /app/app/models.py"
+    - docker exec "$BUILD_CONTAINER_NAME" sh -c "test -f /app/app/planfix_client.py"
+    - docker exec "$BUILD_CONTAINER_NAME" sh -c "test -f /app/app/snapshot_builder.py"
+    - docker exec "$BUILD_CONTAINER_NAME" sh -c "test -f /app/app/metrics_writer.py"
+
+    - echo "Stop container, do not remove"
+    - docker stop "$BUILD_CONTAINER_NAME"
+
+    - echo "Save image artifact"
+    - docker save "$IMAGE_FULL" -o image.tar
+
+    - echo "$IMAGE_FULL" > image_name.txt
+  
+  after_script:
+    - docker rm -f "$BUILD_CONTAINER_NAME" 2>/dev/null || true
+    - docker image rm "$IMAGE_FULL" 2>/dev/null || true
+    - docker builder prune -af || true
+    - docker system prune -af --volumes || true
+    
+  artifacts:
+    paths:
+      - image.tar
+      - image_name.txt
+    expire_in: 6 hours
+
+test:
+  stage: test
+  tags: [ci]
+  image: docker:24.0.7
+  when: manual
+  services:
+    - name: docker:24.0.7-dind
+      command: ["--tls=false"]
+  dependencies:
+    - build
+  script:
+    - export IMAGE_FULL="$(cat image_name.txt)"
+    - echo "Load image artifact $IMAGE_FULL"
+    - docker load -i image.tar
+
+    - echo "Create runtime .env for test"
+    - |
+      cat > .env <<EOF
+      PLANFIX_ACCOUNT=$PLANFIX_ACCOUNT
+      PLANFIX_BEARER_TOKEN=$PLANFIX_BEARER_TOKEN
+      VM_URL=$VM_URL
+      VM_USER=$VM_USER
+      VM_PASSWORD=$VM_PASSWORD
+      HTTP_TIMEOUT=$HTTP_TIMEOUT
+      VERIFY_SSL=$VERIFY_SSL
+      DISABLE_PROXY=$DISABLE_PROXY
+      POLL_INTERVAL_SECONDS=$POLL_INTERVAL_SECONDS
+      EOF
+
+    - echo "Run container again with same image tag/version"
+    - docker run -d --name "$TEST_CONTAINER_NAME" --env-file .env "$IMAGE_FULL" sleep 600
+
+    - echo "Run application inside container"
+    - docker exec "$TEST_CONTAINER_NAME" python -m app.main --once --dry-run
+
+    - echo "Stop test container"
+    - docker stop "$TEST_CONTAINER_NAME"
+  after_script:
+    - docker rm -f "$TEST_CONTAINER_NAME" 2>/dev/null || true
+    - docker image rm "$IMAGE_FULL" 2>/dev/null || true
+    - docker builder prune -af || true
+    - docker system prune -af --volumes || true
+  artifacts:
+    paths:
+      - image.tar
+      - image_name.txt
+    expire_in: 6 hours
+
+
+publish:
+  stage: publish
+  when: manual
+  tags: [ci]
+  image: docker:24.0.7
+  services:
+    - name: docker:24.0.7-dind
+      command: ["--tls=false"]
+
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    RELEASE_TAG: "v1.0.1"
+
+  needs:
+    - job: test
+      artifacts: true
+
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+    - when: never
+ 
+  before_script:
+    - export IMAGE_FULL="$(cat image_name.txt)"
+    - 'echo "Using image: $IMAGE_FULL"'
+    - |
+      if [ -z "${RELEASE_TAG}" ]; then
+        echo "❌ RELEASE_TAG обязателен"
+        exit 1
+      fi
+    - echo "Publishing to ${NEXUS_REGISTRY}/${CI_PROJECT_NAME}:${RELEASE_TAG}"
+    - docker load -i image.tar
+    - echo "$NEXUS_PASSWORD" | docker login ${NEXUS_REGISTRY} -u "$NEXUS_USER" --password-stdin
+    - docker tag "$IMAGE_FULL" "${NEXUS_REGISTRY}/${CI_PROJECT_NAME}:${RELEASE_TAG}"
+    - docker tag "$IMAGE_FULL" "${NEXUS_REGISTRY}/${CI_PROJECT_NAME}:latest"
+
+  script:
+    - docker push "${NEXUS_REGISTRY}/${CI_PROJECT_NAME}:${RELEASE_TAG}"
+    - docker push "${NEXUS_REGISTRY}/${CI_PROJECT_NAME}:latest"
+    - echo "RELEASE_TAG=${RELEASE_TAG}" > release.env
+    - echo "IMAGE=${NEXUS_REGISTRY}/${CI_PROJECT_NAME}:${RELEASE_TAG}" >> release.env
+    - cat release.env
+
+  after_script:
+    - docker image rm "$IMAGE_FULL" 2>/dev/null || true
+    - docker image rm "${NEXUS_REGISTRY}/${CI_PROJECT_NAME}:${RELEASE_TAG}" 2>/dev/null || true
+    - docker image rm "${NEXUS_REGISTRY}/${CI_PROJECT_NAME}:latest" 2>/dev/null || true
+    - docker builder prune -af || true
+    - docker system prune -af --volumes || true
+
+  artifacts:
+    reports:
+      dotenv: release.env
+    expire_in: 6 hours
+
+auto_release:
+  stage: auto_release
+  when: on_success
+  image: curlimages/curl:8.7.1
+  tags: [ci]
+
+  needs:
+    - job: publish
+      artifacts: true
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: on_success
+    - when: never
+
+  script:
+    - echo "Create/update GitLab Release for ${RELEASE_TAG}"
+    - 'echo "Image: ${IMAGE}"'
+    - |
+      TAG_STATUS=$(curl -s -o tag-response.json -w "%{http_code}" \
+        --request POST \
+        --header "PRIVATE-TOKEN: ${GITLAB_TOKEN_PLANFIX_AUTORELEASE}" \
+        --data-urlencode "tag_name=${RELEASE_TAG}" \
+        --data-urlencode "ref=${CI_COMMIT_SHA}" \
+        --data-urlencode "message=Release ${RELEASE_TAG}" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/tags")
+
+      echo "Tag API status: ${TAG_STATUS}"
+
+      if [ "${TAG_STATUS}" != "201" ] && [ "${TAG_STATUS}" != "400" ]; then
+        echo "❌ Failed to create tag"
+        cat tag-response.json
+        exit 1
+      fi
+
+    # 2. Готовим JSON с красивым описанием релиза
+    - |
+      cat > release.json <<EOF
+      {
+        "name": "Planfix Monitoring Exporter ${RELEASE_TAG}",
+        "tag_name": "${RELEASE_TAG}",
+        "description": "## Planfix Monitoring Exporter\\n\\n### Release info\\n- **Tag:** \`${RELEASE_TAG}\`\\n- **Image:** \`${IMAGE}\`\\n\\n### Links\\n- [Pipeline ${CI_PIPELINE_ID}](${CI_PROJECT_URL}/-/pipelines/${CI_PIPELINE_ID})\\n- [Commit ${CI_COMMIT_SHORT_SHA}](${CI_PROJECT_URL}/-/commit/${CI_COMMIT_SHA})\\n- [Grafana dashboard](${GRAFANA_URL})\\n- [Nexus image](${NEXUS_UI_URL})\\n\\n### Notes\\n- Container built and tested in GitLab CI\\n- Docker image published to Nexus\\n- Runtime configuration is provided externally via .env and config.json"
+      }
+      EOF
+
+      echo "Generated release.json"
+      cat release.json
+
+    # 3. Пытаемся создать release
+    - |
+      RELEASE_STATUS=$(curl -s -o release-response.json -w "%{http_code}" \
+        --request POST \
+        --header "PRIVATE-TOKEN: ${GITLAB_TOKEN_PLANFIX_AUTORELEASE}" \
+        --header "Content-Type: application/json" \
+        --data @release.json \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases")
+
+      echo "Release create API status: ${RELEASE_STATUS}"
+
+      if [ "${RELEASE_STATUS}" = "201" ]; then
+        echo "✅ Release created"
+        cat release-response.json
+        exit 0
+      fi
+
+      if [ "${RELEASE_STATUS}" = "409" ]; then
+        echo "Release already exists, updating..."
+      else
+        echo "❌ Failed to create release"
+        cat release-response.json
+        exit 1
+      fi
+
+    # 4. Если release уже существует — обновляем
+    - |
+      UPDATE_STATUS=$(curl -s -o release-update-response.json -w "%{http_code}" \
+        --request PUT \
+        --header "PRIVATE-TOKEN: ${GITLAB_TOKEN_PLANFIX_AUTORELEASE}" \
+        --header "Content-Type: application/json" \
+        --data @release.json \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases/${RELEASE_TAG}")
+
+      echo "Release update API status: ${UPDATE_STATUS}"
+
+      if [ "${UPDATE_STATUS}" != "200" ]; then
+        echo "❌ Failed to update release"
+        cat release-update-response.json
+        exit 1
+      fi
+
+      echo "✅ Release updated"
+      cat release-update-response.json

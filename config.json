@@ -1,0 +1,29 @@
+{
+  "account": "example-account",
+  "projects": [
+    {"id": 101, "name": "Проект A"},
+    {"id": 102, "name": "Проект B"},
+    {"id": 103, "name": "Проект C"},
+    {"id": 104, "name": "Проект D"},
+    {"id": 105, "name": "Наблюдаемость"},
+    {"id": 106, "name": "CI/CD"},
+    {"id": 107, "name": "Внутреннее"},
+    {"id": 108, "name": "Идеи"}
+  ],
+  "employees": [
+    {"id": 1, "name": "Сотрудник 1"},
+    {"id": 2, "name": "Сотрудник 2"},
+    {"id": 3, "name": "Сотрудник 3"},
+    {"id": 4, "name": "Сотрудник 4"},
+    {"id": 5, "name": "Сотрудник 5"},
+    {"id": 6, "name": "Сотрудник 6"},
+    {"id": 7, "name": "Сотрудник 7"}
+  ],
+  "page_size": 100,
+  "verify_ssl": true,
+  "disable_proxy": true,
+  "http_timeout": 30,
+  "poll_interval_seconds": 3600,
+  "state_file": "planfix_snapshot_state.json",
+  "snapshot_file": "planfix_snapshot.json"
+}

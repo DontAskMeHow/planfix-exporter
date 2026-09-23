@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.log
+planfix_snapshot.json
+planfix_snapshot_state.json
